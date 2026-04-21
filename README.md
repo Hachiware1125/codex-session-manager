@@ -1,24 +1,21 @@
 # Codex Session Manager
 
-A Codex skill for listing, searching, and safely deleting local Codex conversation history.
+历史对话管理：a Codex skill and CLI utility for listing, searching, safely deleting, restoring, and permanently purging local Codex conversation history.
 
-This repository is both:
+It turns local Codex session files into readable indexed tables, so you can choose conversations by `Index` instead of copying long session ids. Deletions are conservative by default: selected sessions are moved into timestamped backups, and deleted conversations can be listed and restored later.
 
-- a portable Codex skill, defined by `SKILL.md`
-- a small command-line utility, implemented in `scripts/delete_codex_session.py`
+## Highlights
 
-The script reads local Codex history files, builds a safer session list, and removes selected sessions with dry runs, confirmations, backups, and atomic JSONL rewrites.
-
-## Features
-
-- Lists sessions from multiple local Codex data sources
-- Searches by session preview, title, id, and optional parsed session-file text
-- Deletes by current list index or stable session id
-- Shows a dry-run plan before changing files
-- Moves matching session files into timestamped backups instead of unlinking them
-- Backs up `history.jsonl` and `session_index.jsonl` before rewriting
-- Writes JSONL files atomically
-- Uses a lock file to avoid concurrent destructive operations
+- Lists all local Codex conversations in an indexed table
+- Hides stable session ids by default to keep the table readable
+- Searches by preview, title, session id, and optional full session text
+- Deletes by current table index or stable session id
+- Moves deleted session files into timestamped backups
+- Lists deleted conversations with their own `Index`
+- Restores one deleted conversation or an entire deletion backup
+- Permanently purges one deleted conversation backup or an entire backup batch
+- Uses dry runs, confirmation gates, backups, atomic JSONL writes, and a lock file for safer operations
+- Has no third-party Python runtime dependencies
 
 ## Data Sources
 
@@ -35,7 +32,7 @@ It combines session information from:
 
 - Python 3.10 or newer
 - macOS, Linux, or another environment with a local Codex data directory
-- No third-party Python dependencies
+- No third-party Python packages
 
 ## Installation As A Codex Skill
 
@@ -46,9 +43,9 @@ mkdir -p ~/.codex/skills
 git clone https://github.com/Hachiware1125/codex-session-manager.git ~/.codex/skills/codex-session-manager
 ```
 
-After installation, ask Codex to use `codex-session-manager` when you want to list, search, inspect, or safely delete local Codex sessions.
+Then ask Codex to use `codex-session-manager` when you want to inspect, clean up, restore, or permanently purge local Codex conversations.
 
-## CLI Usage
+## Quick Start
 
 Run commands from the repository directory:
 
@@ -56,13 +53,23 @@ Run commands from the repository directory:
 cd ~/.codex/skills/codex-session-manager
 ```
 
-List sessions:
+List current conversations:
 
 ```bash
 python3 scripts/delete_codex_session.py --list
 ```
 
-Search by preview, title, or id:
+Example output:
+
+```text
+Index  Updated           Prompts  Sources       Preview
+-----  ----------------  -------  ------------  -------
+    1  2026-04-22 07:25       37  file,index    Example conversation preview
+
+Displayed all 1 conversation(s).
+```
+
+Search current conversations:
 
 ```bash
 python3 scripts/delete_codex_session.py --list --search "keyword"
@@ -74,16 +81,32 @@ Search parsed session-file text too:
 python3 scripts/delete_codex_session.py --list --search "keyword" --full-text
 ```
 
-Preview deletion by current list index:
+Show stable session ids when you need exact identifiers:
+
+```bash
+python3 scripts/delete_codex_session.py --list --show-id
+```
+
+## Delete Conversations
+
+Always list or search immediately before deleting by index. Indexes are valid only for the latest displayed table.
+
+Preview deletion by current table index:
 
 ```bash
 python3 scripts/delete_codex_session.py --delete 3 --dry-run
 ```
 
-Preview deletion by a range of current list indexes:
+Preview deletion by multiple indexes or ranges:
 
 ```bash
 python3 scripts/delete_codex_session.py --delete 2,5-7 --dry-run
+```
+
+Delete after confirming the dry-run plan:
+
+```bash
+python3 scripts/delete_codex_session.py --delete 2,5-7 --yes
 ```
 
 Delete by stable session id:
@@ -92,57 +115,98 @@ Delete by stable session id:
 python3 scripts/delete_codex_session.py --delete-id "00000000-0000-0000-0000-000000000000" --yes
 ```
 
-Use a non-default Codex data directory:
-
-```bash
-python3 scripts/delete_codex_session.py --codex-dir /path/to/.codex --list
-```
-
-## Safety Model
-
-Deletion is intentionally conservative.
-
-Before destructive changes, the script can show:
-
-- selected sessions
-- matching history rows
-- matching index rows
-- matching session files
-- backup directory location
-
-When deletion runs, it creates a backup under:
+Deletion moves session files into a backup directory instead of unlinking them immediately:
 
 ```text
 ~/.codex/history_backups/session-delete-<timestamp>/
 ```
 
-The backup includes:
+## Deleted Conversations
 
-- copies of affected history/index files
-- moved session files
-- `manifest.json` with deleted session ids and moved file paths
-
-Use `--dry-run` whenever you are unsure:
+List deletion backup batches:
 
 ```bash
-python3 scripts/delete_codex_session.py --delete 3 --dry-run
+python3 scripts/delete_codex_session.py --list-backups
 ```
 
-Indexes are ephemeral. Always run the relevant list or search command immediately before deleting by index. If you searched with `--search` or `--full-text`, repeat the same filters for the delete command, or use `--delete-id`.
-
-## Recovery
-
-If you need to recover a deleted session, inspect the latest backup directory:
+List deleted conversations:
 
 ```bash
-ls -lt ~/.codex/history_backups/
+python3 scripts/delete_codex_session.py --list-deleted
 ```
 
-Each deletion backup contains a `manifest.json` file that records which session ids were deleted and where session files were moved.
+Example output:
+
+```text
+Index  Deleted At        Backup.Item  Preview
+-----  ----------------  -----------  -------
+    1  2026-04-21 23:54  1.1          Example deleted conversation
+
+Displayed all 1 deleted conversation(s) from 1 backup(s).
+```
+
+Use the first `Index` column for restore or purge operations. `Backup.Item` is kept only for traceability.
+
+## Restore
+
+Restore one deleted conversation by deleted-list index:
+
+```bash
+python3 scripts/delete_codex_session.py --restore-deleted 1
+```
+
+Restore an entire deletion backup batch:
+
+```bash
+python3 scripts/delete_codex_session.py --restore 1
+```
+
+Restore operations do not ask for a second confirmation when you already selected a backup or deleted-conversation index. They copy moved session files back to their original paths and restore matching `history.jsonl` or `session_index.jsonl` rows when possible.
+
+The backup directory is retained after restore.
+
+## Permanent Purge
+
+Permanent purge removes backup files and cannot be recovered through this skill.
+
+Preview permanent purge of one deleted conversation:
+
+```bash
+python3 scripts/delete_codex_session.py --purge-deleted 1 --dry-run
+```
+
+Permanently purge one deleted conversation after explicit confirmation:
+
+```bash
+python3 scripts/delete_codex_session.py --purge-deleted 1 --yes
+```
+
+Preview permanent purge of an entire backup batch:
+
+```bash
+python3 scripts/delete_codex_session.py --purge-backup 1 --dry-run
+```
+
+Permanently purge an entire backup batch after explicit confirmation:
+
+```bash
+python3 scripts/delete_codex_session.py --purge-backup 1 --yes
+```
+
+## Safety Model
+
+- Current conversation indexes are temporary and belong only to the latest displayed current-conversation table.
+- Deleted conversation indexes are temporary and belong only to the latest displayed deleted-conversation table.
+- `--dry-run` shows planned destructive changes without changing files.
+- Deletion creates a timestamped backup with a `manifest.json`.
+- Restore commands can run directly when the user has clearly selected what to restore.
+- Permanent purge commands should only run after an explicit user confirmation.
+- JSONL rewrites use temporary files and atomic replace.
+- A lock file prevents concurrent destructive operations.
 
 ## Development
 
-Validate the script syntax:
+Validate script syntax:
 
 ```bash
 python3 -m py_compile scripts/delete_codex_session.py
@@ -152,6 +216,18 @@ Check the CLI:
 
 ```bash
 python3 scripts/delete_codex_session.py --help
+```
+
+Useful non-destructive checks:
+
+```bash
+python3 scripts/delete_codex_session.py --list
+python3 scripts/delete_codex_session.py --list-backups
+python3 scripts/delete_codex_session.py --list-deleted
+python3 scripts/delete_codex_session.py --delete 1 --dry-run
+python3 scripts/delete_codex_session.py --restore-deleted 1 --dry-run
+python3 scripts/delete_codex_session.py --purge-deleted 1 --dry-run
+python3 scripts/delete_codex_session.py --purge-backup 1 --dry-run
 ```
 
 Validate the skill structure with the Codex skill creator validator when available:
@@ -165,14 +241,14 @@ python3 /path/to/skill-creator/scripts/quick_validate.py .
 ```text
 codex-session-manager/
 ├── SKILL.md
+├── README.md
+├── LICENSE
 ├── agents/
 │   └── openai.yaml
-├── scripts/
-│   └── delete_codex_session.py
-├── LICENSE
-└── README.md
+└── scripts/
+    └── delete_codex_session.py
 ```
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

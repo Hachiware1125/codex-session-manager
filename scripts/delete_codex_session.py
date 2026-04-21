@@ -45,6 +45,27 @@ class SessionRecord:
     full_text: str = ""
 
 
+@dataclass
+class BackupRecord:
+    index: int
+    path: Path
+    created_at: datetime | None
+    deleted_session_ids: list[str] = field(default_factory=list)
+    moved_session_files: list[Path] = field(default_factory=list)
+    backed_up_files: list[Path] = field(default_factory=list)
+    item_ref: str = ""
+
+
+@dataclass
+class DeletedRecord:
+    index: int
+    backup: BackupRecord
+    item_index: int
+    source: Path
+    session_id: str
+    preview: str
+
+
 def codex_dir_from_env() -> Path:
     return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
 
@@ -321,25 +342,234 @@ def fmt_ts(value: datetime | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def backup_dir(codex_dir: Path) -> Path:
+    return codex_dir / "history_backups"
+
+
+def load_backup_manifest(path: Path) -> dict:
+    manifest_path = path / "manifest.json"
+    with manifest_path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"invalid manifest: {manifest_path}")
+    return data
+
+
+def iter_backups(codex_dir: Path) -> list[BackupRecord]:
+    root = backup_dir(codex_dir)
+    if not root.exists():
+        return []
+
+    records: list[BackupRecord] = []
+    for path in sorted(root.glob("session-delete-*")):
+        if not path.is_dir() or not (path / "manifest.json").exists():
+            continue
+        try:
+            manifest = load_backup_manifest(path)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        deleted_ids = [
+            clean_text(item)
+            for item in manifest.get("deleted_session_ids", [])
+            if clean_text(item)
+        ]
+        moved_files = [
+            Path(item)
+            for item in manifest.get("moved_session_files", [])
+            if isinstance(item, str)
+        ]
+        backed_up_files = [
+            Path(item)
+            for item in manifest.get("backed_up_files", [])
+            if isinstance(item, str)
+        ]
+        records.append(
+            BackupRecord(
+                index=0,
+                path=path,
+                created_at=parse_timestamp(manifest.get("created_at")),
+                deleted_session_ids=deleted_ids,
+                moved_session_files=moved_files,
+                backed_up_files=backed_up_files,
+            )
+        )
+
+    records.sort(
+        key=lambda item: (
+            item.created_at is not None,
+            item.created_at or datetime.fromtimestamp(0),
+            item.path.name,
+        ),
+        reverse=True,
+    )
+    for index, record in enumerate(records, start=1):
+        record.index = index
+    return records
+
+
+def resolve_backup(codex_dir: Path, ref: str) -> BackupRecord:
+    backups = iter_backups(codex_dir)
+    if ref.isdigit():
+        index = int(ref)
+        for backup in backups:
+            if backup.index == index:
+                return backup
+        raise ValueError(f"backup index out of range: {ref}")
+
+    candidate = Path(ref).expanduser()
+    if not candidate.is_absolute():
+        candidate = backup_dir(codex_dir) / ref
+    candidate = candidate.resolve()
+
+    backups_by_path = {backup.path.resolve(): backup for backup in backups}
+    if candidate in backups_by_path:
+        return backups_by_path[candidate]
+    raise ValueError(f"backup not found: {ref}")
+
+
+def resolve_backup_item(codex_dir: Path, ref: str) -> BackupRecord:
+    if "." not in ref:
+        raise ValueError("deleted item must use BACKUP.ITEM format, e.g. 1.2")
+    backup_ref, item_ref = ref.split(".", 1)
+    if not item_ref.isdigit():
+        raise ValueError(f"invalid deleted item index: {ref}")
+    backup = resolve_backup(codex_dir, backup_ref)
+    item_index = int(item_ref)
+    if item_index < 1 or item_index > len(backup.moved_session_files):
+        raise ValueError(f"deleted item index out of range: {ref}")
+    moved_file = backup.moved_session_files[item_index - 1]
+    session_id, _ = preview_deleted_file(moved_file)
+    deleted_ids = [] if session_id == "-" else [session_id]
+    return BackupRecord(
+        index=backup.index,
+        path=backup.path,
+        created_at=backup.created_at,
+        deleted_session_ids=deleted_ids,
+        moved_session_files=[moved_file],
+        backed_up_files=backup.backed_up_files,
+        item_ref=ref,
+    )
+
+
+def resolve_restore_ref(codex_dir: Path, ref: str) -> BackupRecord:
+    if "." in ref:
+        return resolve_backup_item(codex_dir, ref)
+    return resolve_backup(codex_dir, ref)
+
+
+def preview_deleted_file(path: Path, strict: bool = False) -> tuple[str, str]:
+    session_id, _, texts = inspect_session_file(path, strict=strict)
+    preview = clean_text(texts[-1] if texts else path.name)
+    return session_id or extract_id_from_name(path) or "-", preview or "(no prompt text)"
+
+
+def build_deleted_records(backups: list[BackupRecord], strict: bool = False) -> list[DeletedRecord]:
+    records: list[DeletedRecord] = []
+    for backup in backups:
+        for item_index, path in enumerate(backup.moved_session_files, start=1):
+            session_id, preview = preview_deleted_file(path, strict=strict)
+            records.append(
+                DeletedRecord(
+                    index=0,
+                    backup=backup,
+                    item_index=item_index,
+                    source=path,
+                    session_id=session_id,
+                    preview=preview,
+                )
+            )
+    for index, record in enumerate(records, start=1):
+        record.index = index
+    return records
+
+
+def deleted_record_ref(record: DeletedRecord) -> str:
+    return f"{record.backup.index}.{record.item_index}"
+
+
+def backup_from_deleted_record(record: DeletedRecord) -> BackupRecord:
+    deleted_ids = [] if record.session_id == "-" else [record.session_id]
+    return BackupRecord(
+        index=record.backup.index,
+        path=record.backup.path,
+        created_at=record.backup.created_at,
+        deleted_session_ids=deleted_ids,
+        moved_session_files=[record.source],
+        backed_up_files=record.backup.backed_up_files,
+        item_ref=f"{record.index} (backup {deleted_record_ref(record)})",
+    )
+
+
+def resolve_deleted_record(codex_dir: Path, ref: str, strict: bool = False) -> DeletedRecord:
+    records = build_deleted_records(iter_backups(codex_dir), strict=strict)
+    if not ref.isdigit():
+        raise ValueError(f"deleted conversation index must be a number: {ref}")
+    index = int(ref)
+    for record in records:
+        if record.index == index:
+            return record
+    raise ValueError(f"deleted conversation index out of range: {ref}")
+
+
+def print_backups(backups: list[BackupRecord]) -> None:
+    if not backups:
+        print("No deletion backups found.")
+        return
+    print("Index  Created           Sessions  Files  Backup Directory")
+    print("-----  ----------------  --------  -----  ----------------")
+    for backup in backups:
+        print(
+            f"{backup.index:>5}  {fmt_ts(backup.created_at):<16}  "
+            f"{len(backup.deleted_session_ids):>8}  {len(backup.moved_session_files):>5}  {backup.path}"
+        )
+    print(f"\nDisplayed all {len(backups)} deletion backup(s).")
+
+
+def print_deleted_conversations(backups: list[BackupRecord], strict: bool = False) -> None:
+    rows = build_deleted_records(backups, strict=strict)
+
+    if not rows:
+        print("No deleted conversations found in backups.")
+        return
+
+    print("Index  Deleted At        Backup.Item  Preview")
+    print("-----  ----------------  -----------  -------")
+    for record in rows:
+        print(
+            f"{record.index:>5}  {fmt_ts(record.backup.created_at):<16}  "
+            f"{deleted_record_ref(record):<11}  {record.preview}"
+        )
+    print(f"\nDisplayed all {len(rows)} deleted conversation(s) from {len(backups)} backup(s).")
+
+
 def print_warnings(stores: Iterable[JsonlStore]) -> None:
     for store in stores:
         for error in store.errors:
             print(f"Warning: {error}", file=sys.stderr)
 
 
-def print_sessions(sessions: list[SessionRecord]) -> None:
+def print_sessions(sessions: list[SessionRecord], show_id: bool = False) -> None:
     if not sessions:
         print("No matching Codex sessions found.")
         return
-    print("Idx  Updated           Prompts  Sources       Session ID                             Preview")
-    print("---  ----------------  -------  ------------  ------------------------------------  -------")
+    if show_id:
+        print("Index  Updated           Prompts  Sources       Session ID                             Preview")
+        print("-----  ----------------  -------  ------------  ------------------------------------  -------")
+    else:
+        print("Index  Updated           Prompts  Sources       Preview")
+        print("-----  ----------------  -------  ------------  -------")
     for session in sessions:
         preview = session.last_text or session.first_text or session.title or "(no prompt text)"
         sources = ",".join(sorted(session.sources)) or "-"
-        print(
-            f"{session.index:>3}  {fmt_ts(session.updated_at):<16}  "
-            f"{session.prompt_count:>7}  {sources:<12}  {session.session_id:<36}  {preview}"
+        prefix = (
+            f"{session.index:>5}  {fmt_ts(session.updated_at):<16}  "
+            f"{session.prompt_count:>7}  {sources:<12}  "
         )
+        if show_id:
+            print(f"{prefix}{session.session_id:<36}  {preview}")
+        else:
+            print(f"{prefix}{preview}")
+    print(f"\nDisplayed all {len(sessions)} conversation(s).")
 
 
 def validate_index(value: int, max_index: int) -> None:
@@ -513,17 +743,193 @@ def delete_sessions(
     print(f"Deleted {len(selected)} session(s). Session files were moved into the backup directory.")
 
 
+def backup_jsonl_path(backup: BackupRecord, name: str) -> Path:
+    for path in backup.backed_up_files:
+        if path.name == name:
+            return path
+    return backup.path / name
+
+
+def restore_jsonl_rows(
+    current_path: Path,
+    backup_path: Path,
+    key_field: str,
+    selected_ids: set[str],
+    dry_run: bool = False,
+) -> int:
+    if not backup_path.exists():
+        return 0
+
+    current_store = read_jsonl(current_path)
+    backup_store = read_jsonl(backup_path)
+    current_raw = {row.raw.strip() for row in current_store.rows}
+    restored = [
+        row
+        for row in backup_store.rows
+        if clean_text(row.data.get(key_field)) in selected_ids and row.raw.strip() not in current_raw
+    ]
+
+    if restored and not dry_run:
+        atomic_write_jsonl(current_path, current_store.rows + restored)
+    return len(restored)
+
+
+def restore_backup(codex_dir: Path, backup: BackupRecord, dry_run: bool = False) -> None:
+    selected_ids = set(backup.deleted_session_ids)
+
+    print("\nSelected backup:")
+    print(f"  [{backup.index}] {backup.path}")
+    print(f"  created: {fmt_ts(backup.created_at)}")
+
+    print("\nDeleted conversations in backup:")
+    for item_index, path in enumerate(backup.moved_session_files, start=1):
+        _, preview = preview_deleted_file(path)
+        label = backup.item_ref or f"{backup.index}.{item_index}"
+        print(f"  [{label}] {preview}")
+
+    restore_pairs: list[tuple[Path, Path, str]] = []
+    for source in backup.moved_session_files:
+        if not source.exists():
+            restore_pairs.append((source, codex_dir / source.relative_to(backup.path), "missing backup file"))
+            continue
+        target = codex_dir / source.relative_to(backup.path)
+        status = "exists, skip" if target.exists() else "restore"
+        restore_pairs.append((source, target, status))
+
+    history_count = restore_jsonl_rows(
+        codex_dir / "history.jsonl",
+        backup_jsonl_path(backup, "history.jsonl"),
+        "session_id",
+        selected_ids,
+        dry_run=True,
+    )
+    index_count = restore_jsonl_rows(
+        codex_dir / "session_index.jsonl",
+        backup_jsonl_path(backup, "session_index.jsonl"),
+        "id",
+        selected_ids,
+        dry_run=True,
+    )
+
+    print("\nPlanned restore:")
+    print(f"  backup retained: {backup.path}")
+    print(f"  session files restored: {sum(1 for _, _, status in restore_pairs if status == 'restore')}")
+    print(f"  history rows restored: {history_count}")
+    print(f"  index rows restored: {index_count}")
+    for source, target, status in restore_pairs:
+        print(f"    {status}: {source} -> {target}")
+
+    if dry_run:
+        print("\nDry run only. No files changed.")
+        return
+
+    for source, target, status in restore_pairs:
+        if status != "restore":
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+    restored_history = restore_jsonl_rows(
+        codex_dir / "history.jsonl",
+        backup_jsonl_path(backup, "history.jsonl"),
+        "session_id",
+        selected_ids,
+        dry_run=False,
+    )
+    restored_index = restore_jsonl_rows(
+        codex_dir / "session_index.jsonl",
+        backup_jsonl_path(backup, "session_index.jsonl"),
+        "id",
+        selected_ids,
+        dry_run=False,
+    )
+
+    print("\nRestore complete.")
+    print(f"Restored session files: {sum(1 for _, _, status in restore_pairs if status == 'restore')}")
+    print(f"Restored history rows: {restored_history}")
+    print(f"Restored index rows: {restored_index}")
+    print(f"Backup retained: {backup.path}")
+
+
+def purge_backup(backup: BackupRecord, dry_run: bool = False) -> None:
+    files = [path for path in backup.path.rglob("*") if path.is_file()]
+
+    print("\nSelected backup:")
+    print(f"  [{backup.index}] {backup.path}")
+    print(f"  created: {fmt_ts(backup.created_at)}")
+
+    print("\nPlanned purge:")
+    print(f"  backup directory removed: {backup.path}")
+    print(f"  files removed: {len(files)}")
+    for path in files:
+        print(f"    {path}")
+
+    if dry_run:
+        print("\nDry run only. No files changed.")
+        return
+
+    shutil.rmtree(backup.path)
+    print(f"\nPurged backup: {backup.path}")
+
+
+def purge_deleted_item(backup: BackupRecord, dry_run: bool = False) -> None:
+    source = backup.moved_session_files[0]
+    session_id, preview = preview_deleted_file(source)
+
+    print("\nSelected deleted conversation:")
+    print(f"  item: [{backup.item_ref}]")
+    print(f"  backup: [{backup.index}] {backup.path}")
+    print(f"  preview: {preview}")
+
+    print("\nPlanned purge:")
+    print(f"  session file removed: {source}")
+    print("  manifest updated: yes")
+
+    if dry_run:
+        print("\nDry run only. No files changed.")
+        return
+
+    if source.exists():
+        source.unlink()
+
+    manifest = load_backup_manifest(backup.path)
+    moved_files = [
+        item
+        for item in manifest.get("moved_session_files", [])
+        if isinstance(item, str) and Path(item) != source
+    ]
+    deleted_ids = [
+        item
+        for item in manifest.get("deleted_session_ids", [])
+        if clean_text(item) and clean_text(item) != session_id
+    ]
+    manifest["moved_session_files"] = moved_files
+    manifest["deleted_session_ids"] = deleted_ids
+    with (backup.path / "manifest.json").open("w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+
+    print(f"\nPurged deleted conversation from backup: {preview}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="List, search, and safely delete local Codex session history."
     )
     parser.add_argument("--codex-dir", type=Path, default=codex_dir_from_env(), help="Codex data directory.")
-    parser.add_argument("--list", action="store_true", help="List indexed sessions and exit.")
+    parser.add_argument("--list", action="store_true", help="List sessions in a table with Index as the first column.")
+    parser.add_argument("--list-deleted", action="store_true", help="List deleted conversations stored in backups.")
+    parser.add_argument("--list-backups", action="store_true", help="List deletion backup batches.")
+    parser.add_argument("--show-id", action="store_true", help="Include stable session ids in list output.")
     parser.add_argument("--search", metavar="TEXT", help="Filter sessions by preview, title, or id.")
     parser.add_argument("--full-text", action="store_true", help="Search parsed session-file text too.")
     parser.add_argument("--delete", metavar="INDEXES", help="Delete index selection, e.g. 3 or 2,5-7.")
     parser.add_argument("--delete-id", metavar="IDS", help="Delete comma-separated session ids.")
-    parser.add_argument("--dry-run", action="store_true", help="Show deletion plan without changing files.")
+    parser.add_argument("--restore", metavar="BACKUP", help="Restore a backup or deleted item by index, name, or path.")
+    parser.add_argument("--restore-deleted", metavar="INDEX", help="Restore one deleted conversation by list-deleted index.")
+    parser.add_argument("--purge-backup", metavar="BACKUP", help="Permanently delete a backup by index, name, or path.")
+    parser.add_argument("--purge-deleted", metavar="INDEX", help="Permanently delete one deleted conversation by list-deleted index or BACKUP.ITEM.")
+    parser.add_argument("--dry-run", action="store_true", help="Show the planned changes without changing files.")
     parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt.")
     parser.add_argument("--strict", action="store_true", help="Fail on malformed JSONL or unreadable session files.")
     return parser
@@ -534,6 +940,85 @@ def main() -> int:
     args = parser.parse_args()
     codex_dir = args.codex_dir.expanduser().resolve()
 
+    if args.list_backups:
+        print_backups(iter_backups(codex_dir))
+        return 0
+
+    if args.list_deleted:
+        print_deleted_conversations(iter_backups(codex_dir), strict=args.strict)
+        return 0
+
+    if args.restore_deleted:
+        try:
+            record = resolve_deleted_record(codex_dir, args.restore_deleted, strict=args.strict)
+            backup = backup_from_deleted_record(record)
+        except ValueError as exc:
+            print(f"Invalid deleted conversation: {exc}", file=sys.stderr)
+            return 1
+        context = LockFile(codex_dir / ".codex-session-manager.lock") if not args.dry_run else NullContext()
+        with context:
+            restore_backup(codex_dir, backup, dry_run=args.dry_run)
+        if not args.dry_run:
+            refreshed, _, _ = load_sessions(codex_dir, strict=False)
+            print("\nUpdated session list:")
+            print_sessions(refreshed, show_id=args.show_id)
+            print("Indexes may have shifted after restore.")
+        return 0
+
+    if args.restore:
+        try:
+            backup = resolve_restore_ref(codex_dir, args.restore)
+        except ValueError as exc:
+            print(f"Invalid backup: {exc}", file=sys.stderr)
+            return 1
+        context = LockFile(codex_dir / ".codex-session-manager.lock") if not args.dry_run else NullContext()
+        with context:
+            restore_backup(codex_dir, backup, dry_run=args.dry_run)
+        if not args.dry_run:
+            refreshed, _, _ = load_sessions(codex_dir, strict=False)
+            print("\nUpdated session list:")
+            print_sessions(refreshed, show_id=args.show_id)
+            print("Indexes may have shifted after restore.")
+        return 0
+
+    if args.purge_deleted:
+        try:
+            if "." in args.purge_deleted:
+                backup = resolve_backup_item(codex_dir, args.purge_deleted)
+            else:
+                record = resolve_deleted_record(codex_dir, args.purge_deleted, strict=args.strict)
+                backup = backup_from_deleted_record(record)
+        except ValueError as exc:
+            print(f"Invalid deleted item: {exc}", file=sys.stderr)
+            return 1
+        if not args.dry_run and not args.yes:
+            purge_deleted_item(backup, dry_run=True)
+            confirm = input("\nPermanently delete this deleted conversation backup? [y/N]: ").strip().lower()
+            if confirm not in {"y", "yes"}:
+                print("Cancelled.")
+                return 0
+        context = LockFile(codex_dir / ".codex-session-manager.lock") if not args.dry_run else NullContext()
+        with context:
+            purge_deleted_item(backup, dry_run=args.dry_run)
+        return 0
+
+    if args.purge_backup:
+        try:
+            backup = resolve_backup(codex_dir, args.purge_backup)
+        except ValueError as exc:
+            print(f"Invalid backup: {exc}", file=sys.stderr)
+            return 1
+        if not args.dry_run and not args.yes:
+            purge_backup(backup, dry_run=True)
+            confirm = input("\nPermanently delete this backup? [y/N]: ").strip().lower()
+            if confirm not in {"y", "yes"}:
+                print("Cancelled.")
+                return 0
+        context = LockFile(codex_dir / ".codex-session-manager.lock") if not args.dry_run else NullContext()
+        with context:
+            purge_backup(backup, dry_run=args.dry_run)
+        return 0
+
     all_sessions, history_store, index_store = load_sessions(codex_dir, strict=args.strict)
     print_warnings([history_store, index_store])
     sessions = filter_sessions(all_sessions, args.search, full_text=args.full_text)
@@ -542,7 +1027,7 @@ def main() -> int:
         print("No matching Codex sessions found.")
         return 0
 
-    print_sessions(sessions)
+    print_sessions(sessions, show_id=args.show_id)
 
     if args.list and not args.delete and not args.delete_id:
         return 0
@@ -586,7 +1071,7 @@ def main() -> int:
         refreshed, _, _ = load_sessions(codex_dir, strict=False)
         refreshed = filter_sessions(refreshed, args.search, full_text=args.full_text)
         print("\nUpdated session list:")
-        print_sessions(refreshed)
+        print_sessions(refreshed, show_id=args.show_id)
         print("Indexes may have shifted after deletion.")
     return 0
 
