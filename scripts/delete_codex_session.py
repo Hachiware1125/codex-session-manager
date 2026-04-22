@@ -61,9 +61,10 @@ class DeletedRecord:
     index: int
     backup: BackupRecord
     item_index: int
-    source: Path
+    source: Path | None
     session_id: str
     preview: str
+    sources: set[str] = field(default_factory=set)
 
 
 def codex_dir_from_env() -> Path:
@@ -435,20 +436,13 @@ def resolve_backup_item(codex_dir: Path, ref: str) -> BackupRecord:
         raise ValueError(f"invalid deleted item index: {ref}")
     backup = resolve_backup(codex_dir, backup_ref)
     item_index = int(item_ref)
-    if item_index < 1 or item_index > len(backup.moved_session_files):
+    records = build_deleted_records([backup])
+    if item_index < 1 or item_index > len(records):
         raise ValueError(f"deleted item index out of range: {ref}")
-    moved_file = backup.moved_session_files[item_index - 1]
-    session_id, _ = preview_deleted_file(moved_file)
-    deleted_ids = [] if session_id == "-" else [session_id]
-    return BackupRecord(
-        index=backup.index,
-        path=backup.path,
-        created_at=backup.created_at,
-        deleted_session_ids=deleted_ids,
-        moved_session_files=[moved_file],
-        backed_up_files=backup.backed_up_files,
-        item_ref=ref,
-    )
+    record = records[item_index - 1]
+    selected = backup_from_deleted_record(record)
+    selected.item_ref = ref
+    return selected
 
 
 def resolve_restore_ref(codex_dir: Path, ref: str) -> BackupRecord:
@@ -463,11 +457,48 @@ def preview_deleted_file(path: Path, strict: bool = False) -> tuple[str, str]:
     return session_id or extract_id_from_name(path) or "-", preview or "(no prompt text)"
 
 
+def deleted_session_metadata(
+    backup: BackupRecord, session_id: str, strict: bool = False
+) -> tuple[str, set[str]]:
+    preview = ""
+    sources: set[str] = set()
+
+    history_store = read_jsonl(backup_jsonl_path(backup, "history.jsonl"), strict=strict)
+    for row in history_store.rows:
+        if clean_text(row.data.get("session_id")) != session_id:
+            continue
+        sources.add("history")
+        text = clean_text(row.data.get("text"))
+        if text:
+            preview = text
+
+    index_store = read_jsonl(backup_jsonl_path(backup, "session_index.jsonl"), strict=strict)
+    for row in index_store.rows:
+        if clean_text(row.data.get("id")) != session_id:
+            continue
+        sources.add("index")
+        title = clean_text(row.data.get("thread_name"))
+        if title and not preview:
+            preview = title
+
+    return preview or "(no prompt text)", sources
+
+
 def build_deleted_records(backups: list[BackupRecord], strict: bool = False) -> list[DeletedRecord]:
     records: list[DeletedRecord] = []
     for backup in backups:
+        seen_session_ids: set[str] = set()
         for item_index, path in enumerate(backup.moved_session_files, start=1):
             session_id, preview = preview_deleted_file(path, strict=strict)
+            sources = {"file"}
+            if session_id != "-":
+                seen_session_ids.add(session_id)
+                metadata_preview, metadata_sources = deleted_session_metadata(
+                    backup, session_id, strict=strict
+                )
+                sources.update(metadata_sources)
+                if preview == path.name and metadata_preview:
+                    preview = metadata_preview
             records.append(
                 DeletedRecord(
                     index=0,
@@ -476,6 +507,24 @@ def build_deleted_records(backups: list[BackupRecord], strict: bool = False) -> 
                     source=path,
                     session_id=session_id,
                     preview=preview,
+                    sources=sources,
+                )
+            )
+        item_index = len(backup.moved_session_files)
+        for session_id in backup.deleted_session_ids:
+            if session_id in seen_session_ids:
+                continue
+            item_index += 1
+            preview, sources = deleted_session_metadata(backup, session_id, strict=strict)
+            records.append(
+                DeletedRecord(
+                    index=0,
+                    backup=backup,
+                    item_index=item_index,
+                    source=None,
+                    session_id=session_id,
+                    preview=preview,
+                    sources=sources or {"manifest"},
                 )
             )
     for index, record in enumerate(records, start=1):
@@ -494,7 +543,7 @@ def backup_from_deleted_record(record: DeletedRecord) -> BackupRecord:
         path=record.backup.path,
         created_at=record.backup.created_at,
         deleted_session_ids=deleted_ids,
-        moved_session_files=[record.source],
+        moved_session_files=[] if record.source is None else [record.source],
         backed_up_files=record.backup.backed_up_files,
         item_ref=f"{record.index} (backup {deleted_record_ref(record)})",
     )
@@ -532,12 +581,13 @@ def print_deleted_conversations(backups: list[BackupRecord], strict: bool = Fals
         print("No deleted conversations found in backups.")
         return
 
-    print("Index  Deleted At        Backup.Item  Preview")
-    print("-----  ----------------  -----------  -------")
+    print("Index  Deleted At        Backup.Item  Sources        Preview")
+    print("-----  ----------------  -----------  -------------  -------")
     for record in rows:
+        sources = ",".join(sorted(record.sources)) or "-"
         print(
             f"{record.index:>5}  {fmt_ts(record.backup.created_at):<16}  "
-            f"{deleted_record_ref(record):<11}  {record.preview}"
+            f"{deleted_record_ref(record):<11}  {sources:<13}  {record.preview}"
         )
     print(f"\nDisplayed all {len(rows)} deleted conversation(s) from {len(backups)} backup(s).")
 
@@ -782,10 +832,10 @@ def restore_backup(codex_dir: Path, backup: BackupRecord, dry_run: bool = False)
     print(f"  created: {fmt_ts(backup.created_at)}")
 
     print("\nDeleted conversations in backup:")
-    for item_index, path in enumerate(backup.moved_session_files, start=1):
-        _, preview = preview_deleted_file(path)
-        label = backup.item_ref or f"{backup.index}.{item_index}"
-        print(f"  [{label}] {preview}")
+    deleted_records = build_deleted_records([backup])
+    for record in deleted_records:
+        label = backup.item_ref or deleted_record_ref(record)
+        print(f"  [{label}] {record.preview}")
 
     restore_pairs: list[tuple[Path, Path, str]] = []
     for source in backup.moved_session_files:
@@ -872,9 +922,46 @@ def purge_backup(backup: BackupRecord, dry_run: bool = False) -> None:
     print(f"\nPurged backup: {backup.path}")
 
 
+def remove_backup_jsonl_rows(
+    backup: BackupRecord,
+    name: str,
+    key_field: str,
+    selected_ids: set[str],
+    dry_run: bool = False,
+) -> int:
+    path = backup_jsonl_path(backup, name)
+    if not path.exists():
+        return 0
+
+    store = read_jsonl(path)
+    kept = [
+        row
+        for row in store.rows
+        if clean_text(row.data.get(key_field)) not in selected_ids
+    ]
+    removed = len(store.rows) - len(kept)
+    if removed and not dry_run:
+        atomic_write_jsonl(path, kept)
+    return removed
+
+
 def purge_deleted_item(backup: BackupRecord, dry_run: bool = False) -> None:
-    source = backup.moved_session_files[0]
-    session_id, preview = preview_deleted_file(source)
+    source = backup.moved_session_files[0] if backup.moved_session_files else None
+    session_id = backup.deleted_session_ids[0] if backup.deleted_session_ids else "-"
+    if source is not None:
+        file_session_id, preview = preview_deleted_file(source)
+        if session_id == "-":
+            session_id = file_session_id
+    else:
+        preview, _ = deleted_session_metadata(backup, session_id)
+
+    selected_ids = set() if session_id == "-" else {session_id}
+    history_rows = remove_backup_jsonl_rows(
+        backup, "history.jsonl", "session_id", selected_ids, dry_run=True
+    )
+    index_rows = remove_backup_jsonl_rows(
+        backup, "session_index.jsonl", "id", selected_ids, dry_run=True
+    )
 
     print("\nSelected deleted conversation:")
     print(f"  item: [{backup.item_ref}]")
@@ -882,21 +969,29 @@ def purge_deleted_item(backup: BackupRecord, dry_run: bool = False) -> None:
     print(f"  preview: {preview}")
 
     print("\nPlanned purge:")
-    print(f"  session file removed: {source}")
+    if source is not None:
+        print(f"  session file removed: {source}")
+    else:
+        print("  session file removed: none")
+    print(f"  backup history rows removed: {history_rows}")
+    print(f"  backup index rows removed: {index_rows}")
     print("  manifest updated: yes")
 
     if dry_run:
         print("\nDry run only. No files changed.")
         return
 
-    if source.exists():
+    if source is not None and source.exists():
         source.unlink()
+
+    remove_backup_jsonl_rows(backup, "history.jsonl", "session_id", selected_ids, dry_run=False)
+    remove_backup_jsonl_rows(backup, "session_index.jsonl", "id", selected_ids, dry_run=False)
 
     manifest = load_backup_manifest(backup.path)
     moved_files = [
         item
         for item in manifest.get("moved_session_files", [])
-        if isinstance(item, str) and Path(item) != source
+        if isinstance(item, str) and (source is None or Path(item) != source)
     ]
     deleted_ids = [
         item

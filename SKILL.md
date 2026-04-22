@@ -73,9 +73,9 @@ description: "Use when the user wants to list, inspect, search, safely delete, r
 - Matching session files are moved into a timestamped backup directory instead of being unlinked.
 - Backups are written under `~/.codex/history_backups/session-delete-<timestamp>/`.
 - `manifest.json` records deleted ids and moved files for recovery.
-- `--list-deleted` reads backup manifests and shows deleted conversation previews with an `Index` column for direct selection.
+- `--list-deleted` reads backup manifests plus backed-up `history.jsonl` and `session_index.jsonl` rows, so deleted conversations are shown even when they had no session file to move.
 - `--restore` copies a whole backup back to original paths. `--restore-deleted` restores one deleted conversation by `--list-deleted` index.
-- `--purge-deleted` permanently removes one deleted conversation by `--list-deleted` index. It also accepts legacy `BACKUP.ITEM` refs.
+- `--purge-deleted` permanently removes one deleted conversation by `--list-deleted` index, including moved session files and matching rows inside backup JSONL files. It also accepts legacy `BACKUP.ITEM` refs.
 - `--purge-backup` permanently removes an entire deletion backup directory.
 - JSONL writes use a temporary file and atomic replace.
 - A lock file prevents concurrent delete operations.

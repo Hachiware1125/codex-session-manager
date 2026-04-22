@@ -11,9 +11,9 @@ It turns local Codex session files into readable indexed tables, so you can choo
 - Searches by preview, title, session id, and optional full session text
 - Deletes by current table index or stable session id
 - Moves deleted session files into timestamped backups
-- Lists deleted conversations with their own `Index`
+- Lists deleted conversations with their own `Index`, including history-only records without session files
 - Restores one deleted conversation or an entire deletion backup
-- Permanently purges one deleted conversation backup or an entire backup batch
+- Permanently purges one deleted conversation backup, including its backup JSONL rows, or an entire backup batch
 - Uses dry runs, confirmation gates, backups, atomic JSONL writes, and a lock file for safer operations
 - Has no third-party Python runtime dependencies
 
@@ -138,14 +138,15 @@ python3 scripts/delete_codex_session.py --list-deleted
 Example output:
 
 ```text
-Index  Deleted At        Backup.Item  Preview
------  ----------------  -----------  -------
-    1  2026-04-21 23:54  1.1          Example deleted conversation
+Index  Deleted At        Backup.Item  Sources        Preview
+-----  ----------------  -----------  -------------  -------
+    1  2026-04-21 23:54  1.1          file,history   Example deleted conversation
+    2  2026-04-21 23:54  1.2          history        Example history-only deleted conversation
 
-Displayed all 1 deleted conversation(s) from 1 backup(s).
+Displayed all 2 deleted conversation(s) from 1 backup(s).
 ```
 
-Use the first `Index` column for restore or purge operations. `Backup.Item` is kept only for traceability.
+Use the first `Index` column for restore or purge operations. `Backup.Item` is kept only for traceability. `Sources` shows whether the deleted conversation came from a moved session file, backed-up history rows, or both.
 
 ## Restore
 
@@ -199,8 +200,10 @@ python3 scripts/delete_codex_session.py --purge-backup 1 --yes
 - Deleted conversation indexes are temporary and belong only to the latest displayed deleted-conversation table.
 - `--dry-run` shows planned destructive changes without changing files.
 - Deletion creates a timestamped backup with a `manifest.json`.
+- `--list-deleted` includes deleted conversations that only had `history.jsonl` or `session_index.jsonl` rows and no session file to move.
 - Restore commands can run directly when the user has clearly selected what to restore.
 - Permanent purge commands should only run after an explicit user confirmation.
+- `--purge-deleted` removes the selected moved session file when present and removes matching rows from backed-up JSONL files.
 - JSONL rewrites use temporary files and atomic replace.
 - A lock file prevents concurrent destructive operations.
 
